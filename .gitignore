@@ -48,7 +48,8 @@ venv.bak/
 .ipynb_checkpoints
 
 # Project specific
-data/
+data/fake/
+data/real/
 checkpoints/
 *.pth
 *.pt

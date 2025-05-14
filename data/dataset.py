@@ -1,0 +1,221 @@
+import torch
+from torch.utils.data import Dataset
+import cv2
+import numpy as np
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import os
+import pandas as pd
+from facenet_pytorch import MTCNN
+
+class DeepfakeDataset(Dataset):
+    def __init__(self, data_path, transform=None, mode='train', annotations_path=None):
+        self.data_path = data_path
+        self.mode = mode
+        self.annotations_path = annotations_path
+        self.samples = self._load_samples()
+        self.face_detector = MTCNN(keep_all=False, device='cpu')
+        
+        if transform is None:
+            self.transform = self._get_default_transforms()
+        else:
+            self.transform = transform
+            
+    def _load_samples(self):
+        samples = []
+        
+        # Load annotations from Excel file
+        if self.annotations_path and os.path.exists(self.annotations_path):
+            try:
+                # Read Excel file
+                df = pd.read_excel(self.annotations_path)
+                
+                print(f"Excel columns: {df.columns.tolist()}")
+                print(f"First few rows: {df.head()}")
+                
+                # Get list of actual files in directories
+                fake_dir = os.path.join(self.data_path, 'fake')
+                real_dir = os.path.join(self.data_path, 'real')
+                
+                fake_files = os.listdir(fake_dir) if os.path.exists(fake_dir) else []
+                real_files = os.listdir(real_dir) if os.path.exists(real_dir) else []
+                
+                print(f"Found {len(fake_files)} fake files and {len(real_files)} real files")
+                
+                # Direct file mapping approach
+                # Process each file in the directories
+                for filename in fake_files:
+                    samples.append({
+                        'video_path': os.path.join(fake_dir, filename),
+                        'label': 1,  # 1 for fake
+                        'demographics': 0  # Default to male, will be updated if possible
+                    })
+                    
+                for filename in real_files:
+                    samples.append({
+                        'video_path': os.path.join(real_dir, filename),
+                        'label': 0,  # 0 for real
+                        'demographics': 0  # Default to male, will be updated if possible
+                    })
+                
+                # Try to update demographics from Excel if possible
+                # Create a mapping of filenames to gender
+                gender_map = {}
+                for _, row in df.iterrows():
+                    try:
+                        excel_filename = str(row['Filename'])
+                        if 'Gender' in df.columns:
+                            gender = row['Gender']
+                            if isinstance(gender, str):
+                                gender_id = 0 if gender.strip().upper().startswith('M') else 1
+                            else:
+                                gender_id = 0 if gender == 0 else 1
+                            gender_map[excel_filename] = gender_id
+                    except Exception as e:
+                        print(f"Error processing gender for {row}: {e}")
+                
+                # Update demographics in samples where possible
+                for sample in samples:
+                    filename = os.path.basename(sample['video_path'])
+                    # Try exact match
+                    if filename in gender_map:
+                        sample['demographics'] = gender_map[filename]
+                    else:
+                        # Try to match by ID or other pattern
+                        for excel_file, gender_id in gender_map.items():
+                            # Extract ID from filename if possible
+                            if excel_file.split('_')[0] in filename:
+                                sample['demographics'] = gender_id
+                                break
+                
+            except Exception as e:
+                print(f"Error reading Excel file: {e}")
+        
+        # Debug information
+        print(f"Found {len(samples)} samples in {self.mode} mode")
+        
+        # Split dataset for train/val/test if needed
+        if self.mode != 'all' and len(samples) > 0:
+            np.random.seed(42)  # For reproducibility
+            indices = np.random.permutation(len(samples))
+            
+            if self.mode == 'train':
+                # Use 70% for training
+                samples = [samples[i] for i in indices[:int(0.7 * len(samples))]]
+            elif self.mode == 'val':
+                # Use 15% for validation
+                samples = [samples[i] for i in indices[int(0.7 * len(samples)):int(0.85 * len(samples))]]
+            elif self.mode == 'test':
+                # Use 15% for testing
+                samples = [samples[i] for i in indices[int(0.85 * len(samples)):]]
+        
+        print(f"After splitting: {len(samples)} samples in {self.mode} mode")
+        return samples
+    
+    def _extract_frames(self, video_path, num_frames=8):
+        """Extract frames from video and detect faces"""
+        frames = []
+        cap = cv2.VideoCapture(video_path)
+        
+        # Get total frames and calculate step size
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return None
+            
+        step = max(1, total_frames // num_frames)
+        
+        frame_idx = 0
+        while len(frames) < num_frames and frame_idx < total_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if not ret:
+                break
+                
+            # Convert to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Detect face
+            try:
+                boxes, _ = self.face_detector.detect(frame)
+                if boxes is not None and len(boxes) > 0:
+                    # Get the first face
+                    box = boxes[0].astype(int)
+                    x1, y1, x2, y2 = box
+                    
+                    # Add some margin
+                    h, w = frame.shape[:2]
+                    margin = int(min(w, h) * 0.1)
+                    x1 = max(0, x1 - margin)
+                    y1 = max(0, y1 - margin)
+                    x2 = min(w, x2 + margin)
+                    y2 = min(h, y2 + margin)
+                    
+                    face = frame[y1:y2, x1:x2]
+                    if face.size > 0:
+                        frames.append(face)
+            except Exception as e:
+                print(f"Error detecting face: {e}")
+                
+            frame_idx += step
+            
+        cap.release()
+        
+        # If we couldn't extract enough faces, pad with the last face
+        if frames and len(frames) < num_frames:
+            last_face = frames[-1]
+            frames.extend([last_face] * (num_frames - len(frames)))
+            
+        return frames
+        
+    def _get_default_transforms(self):
+        if self.mode == 'train':
+            return A.Compose([
+                A.Resize(224, 224),
+                A.HorizontalFlip(p=0.5),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                A.Normalize(),
+                ToTensorV2()
+            ])
+        else:
+            return A.Compose([
+                A.Resize(224, 224),
+                A.Normalize(),
+                ToTensorV2()
+            ])
+            
+    def __len__(self):
+        return len(self.samples)
+        
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Extract frames from video
+        frames = self._extract_frames(sample['video_path'])
+        
+        if frames is None or len(frames) == 0:
+            # Fallback: create a blank image
+            image = np.zeros((224, 224, 3), dtype=np.uint8)
+            transformed = self.transform(image=image)
+            image = transformed['image']
+            
+            return {
+                'image': image,
+                'label': torch.tensor(sample['label'], dtype=torch.long),
+                'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
+            }
+        
+        # Process each frame
+        processed_frames = []
+        for frame in frames:
+            transformed = self.transform(image=frame)
+            processed_frames.append(transformed['image'])
+            
+        # Stack frames
+        stacked_frames = torch.stack(processed_frames)
+        
+        return {
+            'image': stacked_frames,
+            'label': torch.tensor(sample['label'], dtype=torch.long),
+            'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
+        }
