@@ -82,25 +82,29 @@ def main(args):
     os.makedirs(config['training']['save_dir'], exist_ok=True)
     logger.info(f"Save directory: {config['training']['save_dir']}")
         
-    # Create datasets
-    logger.info("Creating datasets...")
+    # Create datasets with preprocessing
+    logger.info("Creating datasets and preprocessing videos...")
     data_start = time.time()
     
     train_dataset = DeepfakeDataset(
         config['data']['data_path'],
         mode='train',
-        annotations_path=config['data']['annotations_path']
+        annotations_path=config['data']['annotations_path'],
+        preprocess=True,  # Enable preprocessing
+        cache_dir=config['data'].get('cache_dir', None)  # Optional cache directory path
     )
     logger.info(f"Train dataset created with {len(train_dataset)} samples")
     
     val_dataset = DeepfakeDataset(
         config['data']['data_path'],
         mode='val',
-        annotations_path=config['data']['annotations_path']
+        annotations_path=config['data']['annotations_path'],
+        preprocess=True,  # Enable preprocessing
+        cache_dir=config['data'].get('cache_dir', None)  # Optional cache directory path
     )
     logger.info(f"Validation dataset created with {len(val_dataset)} samples")
     
-    logger.info(f"Dataset creation took {time.time() - data_start:.2f} seconds")
+    logger.info(f"Dataset creation and preprocessing took {time.time() - data_start:.2f} seconds")
     
     # Create dataloaders
     logger.info("Creating dataloaders...")
