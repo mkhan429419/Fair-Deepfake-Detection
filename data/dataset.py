@@ -10,6 +10,7 @@ from facenet_pytorch import MTCNN
 import pickle
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+from data.preprocessing import FacePreprocessor
 
 # Define function at module level for multiprocessing
 def process_video_standalone(work_item):
@@ -81,7 +82,7 @@ def process_video_standalone(work_item):
         return f"Error: {video_path} - {str(e)}"
 
 class DeepfakeDataset(Dataset):
-    def __init__(self, data_path, transform=None, mode='train', annotations_path=None, preprocess=False, num_frames=8, cache_dir=None):
+    def __init__(self, data_path, transform=None, mode='train', annotations_path=None, preprocess=False, num_frames=6, cache_dir=None):
         self.data_path = data_path
         self.mode = mode
         self.annotations_path = annotations_path
@@ -93,7 +94,6 @@ class DeepfakeDataset(Dataset):
             os.makedirs(self.cache_dir, exist_ok=True)
             
         self.samples = self._load_samples()
-        self.face_detector = MTCNN(keep_all=False, device='cpu')
         self.processed_frames_cache = {}
         
         if transform is None:
@@ -184,14 +184,14 @@ class DeepfakeDataset(Dataset):
             indices = np.random.permutation(len(samples))
             
             if self.mode == 'train':
-                # Use 70% for training
-                samples = [samples[i] for i in indices[:int(0.7 * len(samples))]]
+                # Use 80% for training (changed from 70%)
+                samples = [samples[i] for i in indices[:int(0.8 * len(samples))]]
             elif self.mode == 'val':
-                # Use 15% for validation
-                samples = [samples[i] for i in indices[int(0.7 * len(samples)):int(0.85 * len(samples))]]
+                # Use 10% for validation (changed from 15%)
+                samples = [samples[i] for i in indices[int(0.8 * len(samples)):int(0.9 * len(samples))]]
             elif self.mode == 'test':
-                # Use 15% for testing
-                samples = [samples[i] for i in indices[int(0.85 * len(samples)):]]
+                # Use 10% for testing (changed from 15%)
+                samples = [samples[i] for i in indices[int(0.9 * len(samples)):]]
         
         print(f"After splitting: {len(samples)} samples in {self.mode} mode")
         return samples
@@ -265,8 +265,8 @@ class DeepfakeDataset(Dataset):
         
         print(f"Preprocessing complete: {success} processed, {skipped} skipped, {failed} failed")
 
-    def _extract_frames(self, video_path, num_frames=8):
-        """Extract frames from video and detect faces"""
+    def _extract_frames(self, video_path, num_frames=6):
+        """Extract frames from video and detect faces with fallback"""
         # Check cache first
         cache_path = self._get_cache_path(video_path)
         if os.path.exists(cache_path):
@@ -287,6 +287,10 @@ class DeepfakeDataset(Dataset):
             
         step = max(1, total_frames // num_frames)
         
+        # Create detectors locally in this method instead of using instance variables
+        face_detector = MTCNN(keep_all=False, device='cpu')
+        haar_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
         frame_idx = 0
         while len(frames) < num_frames and frame_idx < total_frames:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -298,9 +302,10 @@ class DeepfakeDataset(Dataset):
             # Convert to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Detect face
+            # Detect face with MTCNN
+            face_detected = False
             try:
-                boxes, _ = self.face_detector.detect(frame)
+                boxes, _ = face_detector.detect(frame)  # Use local variable
                 if boxes is not None and len(boxes) > 0:
                     # Get the first face
                     box = boxes[0].astype(int)
@@ -317,9 +322,45 @@ class DeepfakeDataset(Dataset):
                     face = frame[y1:y2, x1:x2]
                     if face.size > 0:
                         frames.append(face)
+                        face_detected = True
             except Exception as e:
-                print(f"Error detecting face: {e}")
+                print(f"MTCNN error: {e}")
+            
+            # Fallback to Haar cascade if MTCNN fails
+            if not face_detected:
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    faces = haar_detector.detectMultiScale(gray, 1.3, 5)  # Use local variable
+                    if len(faces) > 0:
+                        x, y, w, h = faces[0]
+                        
+                        # Add margin
+                        h_img, w_img = frame.shape[:2]
+                        margin = int(min(w_img, h_img) * 0.1)
+                        x1 = max(0, x - margin)
+                        y1 = max(0, y - margin)
+                        x2 = min(w_img, x + w + margin)
+                        y2 = min(h_img, y + h + margin)
+                        
+                        face = frame[y1:y2, x1:x2]
+                        if face.size > 0:
+                            frames.append(face)
+                            face_detected = True
+                except Exception as e:
+                    print(f"Haar cascade error: {e}")
                 
+            # If all detection methods fail, use the whole frame
+            if not face_detected:
+                # Resize to a reasonable size if necessary
+                h, w = frame.shape[:2]
+                if h > 300 and w > 300:
+                    # Center crop
+                    crop_size = min(h, w)
+                    start_h = (h - crop_size) // 2
+                    start_w = (w - crop_size) // 2
+                    frame = frame[start_h:start_h+crop_size, start_w:start_w+crop_size]
+                frames.append(frame)
+            
             frame_idx += step
             
         cap.release()
@@ -344,14 +385,17 @@ class DeepfakeDataset(Dataset):
             return A.Compose([
                 A.Resize(224, 224),
                 A.HorizontalFlip(p=0.5),
-                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                A.Normalize(),
+                A.RandomRotate90(p=0.3),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+                A.RandomBrightnessContrast(p=0.3),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])
         else:
             return A.Compose([
                 A.Resize(224, 224),
-                A.Normalize(),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])
             
@@ -369,24 +413,37 @@ class DeepfakeDataset(Dataset):
             image = np.zeros((224, 224, 3), dtype=np.uint8)
             transformed = self.transform(image=image)
             image = transformed['image']
+            face_mask = torch.zeros((1, 224, 224), dtype=torch.float32)
             
             return {
                 'image': image,
+                'face_mask': face_mask,
                 'label': torch.tensor(sample['label'], dtype=torch.long),
                 'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
             }
         
+        # Create a face preprocessor locally for this method
+        face_preprocessor = FacePreprocessor()
+        
         # Process each frame
         processed_frames = []
+        face_masks = []
         for frame in frames:
-            transformed = self.transform(image=frame)
-            processed_frames.append(transformed['image'])
+            # Generate face mask for the frame
+            face_mask = face_preprocessor.extract_face_mask(frame)
             
-        # Stack frames
+            # Apply transformations to both image and mask
+            transformed = self.transform(image=frame, mask=face_mask)
+            processed_frames.append(transformed['image'])
+            face_masks.append(torch.tensor(transformed['mask']).unsqueeze(0))
+            
+        # Stack frames and masks
         stacked_frames = torch.stack(processed_frames)
+        stacked_masks = torch.stack(face_masks)
         
         return {
             'image': stacked_frames,
+            'face_mask': stacked_masks,
             'label': torch.tensor(sample['label'], dtype=torch.long),
             'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
         }

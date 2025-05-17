@@ -1,16 +1,16 @@
 # Model Configuration
 model:
-  backbone: "resnet" # Using ResNet for better CPU performance
+  backbone: "resnet" # Changed from "mobilenet" to "efficientnet"
   num_classes: 2
   pretrained: true
 
 # Training Configuration
 training:
-  batch_size: 2
-  num_epochs: 5
-  learning_rate: 0.0001
-  weight_decay: 0.00001
-  lambda_fair: 1.0
+  batch_size: 8
+  num_epochs: 1
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  lambda_fair: 1.5
   device: "cpu" # We'll use CPU with OpenMP acceleration
   save_dir: "checkpoints"
   use_openmp: true # Enable OpenMP acceleration
@@ -20,6 +20,6 @@ training:
 data:
   data_path: "data"
   annotations_path: "data/GBDF_training_labels.xlsx"
-  test_path: "data" # Added for evaluation
+  test_path: "data/test" # Added for evaluation
   image_size: 224
   num_workers: 4
