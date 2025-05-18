@@ -5,6 +5,9 @@ import os
 import cv2
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+import glob
+from tabulate import tabulate
+import argparse
 
 # Set OpenMP environment variables
 os.environ["OMP_NUM_THREADS"] = "8"  # Set to number of physical cores
@@ -14,6 +17,8 @@ os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"  # Intel CPU optimiz
 # Import your models
 from models.fair_deepfake_detector import FairDeepfakeDetector
 from utils.metrics import FairnessMetrics
+from data.dataset import DeepfakeDataset  # Import the same dataset class used in training
+from utils.trainer import FairTrainer  # Import the trainer for consistent evaluation
 
 class SimpleDeepfakeDataset(Dataset):
     """Simplified dataset that directly loads videos from real/fake folders"""
@@ -139,30 +144,16 @@ def evaluate(config_path, model_path):
     if not os.path.exists(test_path):
         print(f"ERROR: Test directory {test_path} does not exist!")
         return
-        
-    # Print subdirectory information
-    subdirs = [d for d in os.listdir(test_path) if os.path.isdir(os.path.join(test_path, d))]
-    print(f"Found subdirectories: {subdirs}")
     
-    real_path = os.path.join(test_path, 'real')
-    fake_path = os.path.join(test_path, 'fake')
-    
-    # Check real directory
-    if os.path.exists(real_path):
-        real_videos = [f for f in os.listdir(real_path) if f.endswith(('.mp4', '.avi', '.mov', '.webm'))]
-        print(f"Found {len(real_videos)} videos in real directory")
-    else:
-        print("Real directory does not exist!")
-        
-    # Check fake directory
-    if os.path.exists(fake_path):
-        fake_videos = [f for f in os.listdir(fake_path) if f.endswith(('.mp4', '.avi', '.mov', '.webm'))]
-        print(f"Found {len(fake_videos)} videos in fake directory")
-    else:
-        print("Fake directory does not exist!")
-    
-    # Create dataset and dataloader
-    test_dataset = SimpleDeepfakeDataset(test_path)
+    # Create dataset using the same DeepfakeDataset class as in training
+    print("Creating test dataset...")
+    test_dataset = DeepfakeDataset(
+        test_path,
+        mode='test',
+        annotations_path=config['data'].get('annotations_path'),
+        preprocess=True,
+        cache_dir=config['data'].get('cache_dir', None)
+    )
     
     if len(test_dataset) == 0:
         print("ERROR: No samples found for evaluation. Please check your data paths.")
@@ -192,46 +183,25 @@ def evaluate(config_path, model_path):
     model.to(config['training']['device'])
     model.eval()
     
-    # Evaluation
-    all_preds = []
-    all_labels = []
-    all_demographics = []
+    # Initialize the trainer for consistent evaluation
+    from models.losses import DAWFDDLoss
+    loss_fn = DAWFDDLoss(lambda_fair=config['training']['lambda_fair'])
+    trainer = FairTrainer(
+        model=model,
+        loss_fn=loss_fn,
+        device=config['training']['device'],
+        lr=config['training']['learning_rate']
+    )
     
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            images = batch['image'].to(config['training']['device'])
-            labels = batch['label']
-            demographics = batch['demographics']
-            
-            # Print shapes for debugging
-            if batch_idx == 0:
-                print(f"Input shape: {images.shape}")
-            
-            # Reshape if needed - handle both [B, F, C, H, W] and [B, C, H, W] formats
-            if images.dim() == 5:  # [B, F, C, H, W]
-                outputs = model(images)
-            else:  # [B, C, H, W]
-                outputs = model(images.unsqueeze(1))
-                
-            preds = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
-            
-            all_preds.extend(preds)
-            all_labels.extend(labels.numpy())
-            all_demographics.extend(demographics.numpy())
-            
-    # Convert to numpy arrays
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_demographics = np.array(all_demographics)
+    # Use the trainer's evaluate method for consistency with training
+    print("Evaluating model...")
+    val_results = trainer.evaluate(test_loader)
     
-    print(f"Evaluation complete on {len(all_preds)} samples")
-    print(f"Labels distribution: {np.bincount(all_labels)}")
-    
-    # Compute metrics
+    # Compute metrics using the same method as in training
     metrics = FairnessMetrics.compute_group_metrics(
-        all_preds,
-        all_labels,
-        all_demographics
+        val_results['predictions'],
+        val_results['labels'],
+        val_results['demographics']
     )
     
     # Print results
@@ -265,11 +235,187 @@ def evaluate(config_path, model_path):
     print("------------------------------------------------------------")
     
     for i, sample in enumerate(test_dataset.samples):
-        if i < len(all_preds):
-            filename = os.path.basename(sample['path'])
+        if i < len(val_results['predictions']):
+            # Get filename - handle different dataset structures
+            if 'path' in sample:
+                filename = os.path.basename(sample['path'])
+            elif 'video_path' in sample:
+                filename = os.path.basename(sample['video_path'])
+            else:
+                filename = f"sample_{i}"  # Fallback if no path is available
+            
             label = "FAKE" if sample['label'] == 1 else "REAL"
-            pred = "FAKE" if all_preds[i] > 0.5 else "REAL"
-            print(f"{filename:<30} | {label:<10} | {pred:<10} | {all_preds[i]:.4f}")
+            pred = "FAKE" if val_results['predictions'][i] > 0.5 else "REAL"
+            print(f"{filename:<30} | {label:<10} | {pred:<10} | {val_results['predictions'][i]:.4f}")
+
+def evaluate_all_models(config_path):
+    """Evaluate all models in the checkpoints directory"""
+    # Load configuration
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Get the checkpoint directory
+    checkpoint_dir = config['training'].get('save_dir', 'checkpoints')
+    print(f"Looking for models in: {checkpoint_dir}")
+    
+    # Find all .pth files in the checkpoint directory
+    model_paths = glob.glob(os.path.join(checkpoint_dir, "*.pth"))
+    
+    if not model_paths:
+        print(f"No model files found in {checkpoint_dir}")
+        return
+    
+    print(f"Found {len(model_paths)} model files to evaluate")
+    
+    # Create dataset using the same DeepfakeDataset class as in training
+    test_path = config['data'].get('test_path', 'data/test')
+    print("Creating test dataset...")
+    test_dataset = DeepfakeDataset(
+        test_path,
+        mode='test',
+        annotations_path=config['data'].get('annotations_path'),
+        preprocess=True,
+        cache_dir=config['data'].get('cache_dir', None)
+    )
+    
+    if len(test_dataset) == 0:
+        print("ERROR: No samples found for evaluation. Please check your data paths.")
+        return
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['data']['num_workers']
+    )
+    
+    # Initialize the loss function for the trainer
+    from models.losses import DAWFDDLoss
+    loss_fn = DAWFDDLoss(lambda_fair=config['training']['lambda_fair'])
+    
+    # Results to store
+    all_results = []
+    
+    # Evaluate each model
+    for model_path in model_paths:
+        model_name = os.path.basename(model_path)
+        print(f"\n{'='*80}")
+        print(f"Evaluating model: {model_name}")
+        print(f"{'='*80}")
+        
+        # Initialize model - use the same backbone as in training
+        model = FairDeepfakeDetector(
+            backbone=config['model']['backbone'],
+            num_classes=config['model']['num_classes']
+        )
+        
+        # Load trained weights
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=config['training']['device']))
+            print(f"Successfully loaded model from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            continue
+            
+        model.to(config['training']['device'])
+        model.eval()
+        
+        # Initialize trainer for consistent evaluation
+        trainer = FairTrainer(
+            model=model,
+            loss_fn=loss_fn,
+            device=config['training']['device'],
+            lr=config['training']['learning_rate']
+        )
+        
+        # Use the trainer's evaluate method
+        print("Evaluating model...")
+        val_results = trainer.evaluate(test_loader)
+        
+        # Compute metrics using the same method as in training
+        metrics = FairnessMetrics.compute_group_metrics(
+            val_results['predictions'],
+            val_results['labels'],
+            val_results['demographics']
+        )
+        
+        # Store results
+        model_results = {
+            'model_name': model_name,
+            'auc': metrics['overall']['auc'],
+            'accuracy': metrics['overall']['accuracy'],
+            'precision': metrics['overall']['precision'],
+            'recall': metrics['overall']['recall'],
+            'f1': metrics['overall']['f1'],
+            'demographic_parity': metrics.get('fairness', {}).get('demographic_parity', float('nan')),
+            'max_auc_disparity': metrics.get('fairness', {}).get('max_auc_disparity', float('nan'))
+        }
+        all_results.append(model_results)
+        
+        # Print results for this model
+        print("\nOverall Metrics:")
+        print(f"AUC: {metrics['overall']['auc']:.4f}")
+        print(f"Accuracy: {metrics['overall']['accuracy']:.4f}")
+        print(f"Precision: {metrics['overall']['precision']:.4f}")
+        print(f"Recall: {metrics['overall']['recall']:.4f}")
+        print(f"F1: {metrics['overall']['f1']:.4f}")
+        
+        # Print individual file predictions for this model
+        print("\nIndividual Predictions:")
+        print("------------------------------------------------------------")
+        print(f"{'Filename':<30} | {'True Label':<10} | {'Prediction':<10} | Probability")
+        print("------------------------------------------------------------")
+        
+        for i, sample in enumerate(test_dataset.samples):
+            if i < len(val_results['predictions']):
+                # Get filename - handle different dataset structures
+                if 'path' in sample:
+                    filename = os.path.basename(sample['path'])
+                elif 'video_path' in sample:
+                    filename = os.path.basename(sample['video_path'])
+                else:
+                    filename = f"sample_{i}"  # Fallback if no path is available
+            
+                label = "FAKE" if sample['label'] == 1 else "REAL"
+                pred = "FAKE" if val_results['predictions'][i] > 0.5 else "REAL"
+                print(f"{filename:<30} | {label:<10} | {pred:<10} | {val_results['predictions'][i]:.4f}")
+    
+    # Compare all models
+    print("\n\nModel Comparison:")
+    
+    # Sort results by AUC
+    all_results = sorted(all_results, key=lambda x: x['auc'], reverse=True)
+    
+    # Create table
+    table_headers = ["Model", "AUC", "Accuracy", "F1", "Demo. Parity", "AUC Disparity"]
+    table_data = []
+    
+    for result in all_results:
+        table_data.append([
+            result['model_name'],
+            f"{result['auc']:.4f}",
+            f"{result['accuracy']:.4f}",
+            f"{result['f1']:.4f}",
+            f"{result['demographic_parity']:.4f}",
+            f"{result['max_auc_disparity']:.4f}"
+        ])
+    
+    # Print table
+    print(tabulate(table_data, headers=table_headers, tablefmt="grid"))
+    
+    # Identify best model
+    best_model = all_results[0]['model_name']
+    print(f"\nBest Model (by AUC): {best_model} with AUC: {all_results[0]['auc']:.4f}")
 
 if __name__ == "__main__":
-    evaluate('config/config.yaml', 'checkpoints/best_model.pth')
+    parser = argparse.ArgumentParser(description="Evaluate deepfake detection models")
+    parser.add_argument('--config', type=str, default='config/config.yaml', help='Path to config file')
+    parser.add_argument('--model', type=str, help='Path to specific model file (if not provided, evaluates all models)')
+    args = parser.parse_args()
+    
+    if args.model:
+        # Evaluate a specific model
+        evaluate(args.config, args.model)
+    else:
+        # Evaluate all models in the checkpoint directory
+        evaluate_all_models(args.config)
