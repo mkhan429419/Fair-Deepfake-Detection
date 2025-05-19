@@ -3,6 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 from transformers import ViTModel
 import os
+import torch.nn.functional as F
 
 # Set OpenMP environment variables for Intel CPU optimization
 os.environ["OMP_NUM_THREADS"] = "8"  # Set to number of physical cores
@@ -41,6 +42,11 @@ class FairDeepfakeDetector(nn.Module):
             self.backbone = models.mobilenet_v2(pretrained=True)
             self.backbone.classifier = nn.Identity()
             feature_dim = 1280
+        elif backbone == 'efficientnet':
+            # EfficientNet is both accurate and efficient
+            self.backbone = models.efficientnet_b0(pretrained=True)
+            self.backbone.classifier = nn.Identity()
+            feature_dim = 1280
         else:  # Default to ViT
             self.backbone = ViTModel.from_pretrained('google/vit-base-patch16-224')
             feature_dim = 768
@@ -67,8 +73,15 @@ class FairDeepfakeDetector(nn.Module):
             # Reshape to process all frames
             x = x.view(-1, x.size(2), x.size(3), x.size(4))
             
+            # Adjust face mask shape if provided
+            if face_mask is not None:
+                if face_mask.dim() == 4:  # [batch, frames, height, width]
+                    face_mask = face_mask.view(-1, face_mask.size(2), face_mask.size(3))
+                elif face_mask.dim() == 5:  # [batch, frames, 1, height, width]
+                    face_mask = face_mask.view(-1, face_mask.size(3), face_mask.size(4))
+            
             # Extract features for each frame
-            if self.backbone_type in ['inception', 'resnet', 'mobilenet']:
+            if self.backbone_type in ['inception', 'resnet', 'mobilenet', 'efficientnet']:
                 frame_features = self.backbone(x)
             else:  # ViT
                 outputs = self.backbone(x)
@@ -86,16 +99,44 @@ class FairDeepfakeDetector(nn.Module):
             features = features.mean(dim=1)
         else:
             # Single image processing
-            if self.backbone_type in ['inception', 'resnet', 'mobilenet']:
+            if self.backbone_type in ['inception', 'resnet', 'mobilenet', 'efficientnet']:
                 features = self.backbone(x)
             else:  # ViT
                 outputs = self.backbone(x)
                 features = outputs.last_hidden_state[:, 0]
             
+        # Enhance face-context masking
         if face_mask is not None:
-            # Apply face-context attention
-            context_features = features * (1 - face_mask)
-            face_features = features * face_mask
+            # Convert to spatial attention if needed
+            if face_mask.dim() != features.dim():
+                # Create spatial attention from mask
+                # For CNN backbones, adapt the mask to the feature space
+                if self.backbone_type in ['inception', 'resnet', 'mobilenet', 'efficientnet']:
+                    # Get the spatial dimensions of features
+                    if features.dim() > 2:  # If features still have spatial dimensions
+                        face_mask = F.interpolate(face_mask.unsqueeze(1), 
+                                                 size=features.size()[2:], 
+                                                 mode='bilinear', 
+                                                 align_corners=False).squeeze(1)
+                        # Apply spatially
+                        face_features = features * face_mask.unsqueeze(1)
+                        context_features = features * (1 - face_mask).unsqueeze(1)
+                    else:
+                        # For flattened features, use global mask strength
+                        mask_strength = face_mask.mean().item()
+                        face_features = features * mask_strength
+                        context_features = features * (1 - mask_strength)
+                else:
+                    # For ViT, use the global mask strength
+                    mask_strength = face_mask.mean().item()
+                    face_features = features * mask_strength
+                    context_features = features * (1 - mask_strength)
+            else:
+                # Masks already aligned with features
+                face_features = features * face_mask
+                context_features = features * (1 - face_mask)
+            
+            # Apply context attention
             attended_features, _ = self.context_attention(
                 face_features.unsqueeze(1),
                 context_features.unsqueeze(1),

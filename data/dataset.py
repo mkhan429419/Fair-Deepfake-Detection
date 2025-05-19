@@ -7,19 +7,103 @@ from albumentations.pytorch import ToTensorV2
 import os
 import pandas as pd
 from facenet_pytorch import MTCNN
+import pickle
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from data.preprocessing import FacePreprocessor
+
+# Define function at module level for multiprocessing
+def process_video_standalone(work_item):
+    idx, video_path, cache_path, num_frames = work_item
+    
+    try:
+        # Create a temporary MTCNN detector for this process
+        face_detector = MTCNN(keep_all=False, device='cpu')
+        
+        # Extract frames
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return f"Failed (no frames): {video_path}"
+            
+        step = max(1, total_frames // num_frames)
+        frames = []
+        frame_idx = 0
+        
+        while len(frames) < num_frames and frame_idx < total_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if not ret:
+                break
+                
+            # Convert to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Detect face
+            try:
+                boxes, _ = face_detector.detect(frame)
+                if boxes is not None and len(boxes) > 0:
+                    # Get the first face
+                    box = boxes[0].astype(int)
+                    x1, y1, x2, y2 = box
+                    
+                    # Add some margin
+                    h, w = frame.shape[:2]
+                    margin = int(min(w, h) * 0.1)
+                    x1 = max(0, x1 - margin)
+                    y1 = max(0, y1 - margin)
+                    x2 = min(w, x2 + margin)
+                    y2 = min(h, y2 + margin)
+                    
+                    face = frame[y1:y2, x1:x2]
+                    if face.size > 0:
+                        frames.append(face)
+            except Exception as e:
+                print(f"Error detecting face: {e}")
+                
+            frame_idx += step
+            
+        cap.release()
+        
+        # If we couldn't extract enough faces, pad with the last face
+        if frames and len(frames) < num_frames:
+            last_face = frames[-1]
+            frames.extend([last_face] * (num_frames - len(frames)))
+        
+        # Save to cache
+        if frames and len(frames) > 0:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(frames, f)
+            return f"Processed: {video_path}"
+        else:
+            return f"Failed (no frames): {video_path}"
+    except Exception as e:
+        return f"Error: {video_path} - {str(e)}"
 
 class DeepfakeDataset(Dataset):
-    def __init__(self, data_path, transform=None, mode='train', annotations_path=None):
+    def __init__(self, data_path, transform=None, mode='train', annotations_path=None, preprocess=False, num_frames=6, cache_dir=None):
         self.data_path = data_path
         self.mode = mode
         self.annotations_path = annotations_path
+        self.num_frames = num_frames
+        self.cache_dir = cache_dir or os.path.join(data_path, 'preprocessed_cache')
+        
+        # Create cache directory if it doesn't exist
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+            
         self.samples = self._load_samples()
-        self.face_detector = MTCNN(keep_all=False, device='cpu')
+        self.processed_frames_cache = {}
         
         if transform is None:
             self.transform = self._get_default_transforms()
         else:
             self.transform = transform
+            
+        # Run preprocessing if requested
+        if preprocess:
+            self._preprocess_all_videos()
             
     def _load_samples(self):
         samples = []
@@ -100,20 +184,99 @@ class DeepfakeDataset(Dataset):
             indices = np.random.permutation(len(samples))
             
             if self.mode == 'train':
-                # Use 70% for training
-                samples = [samples[i] for i in indices[:int(0.7 * len(samples))]]
+                # Use 80% for training (changed from 70%)
+                samples = [samples[i] for i in indices[:int(0.8 * len(samples))]]
             elif self.mode == 'val':
-                # Use 15% for validation
-                samples = [samples[i] for i in indices[int(0.7 * len(samples)):int(0.85 * len(samples))]]
+                # Use 10% for validation (changed from 15%)
+                samples = [samples[i] for i in indices[int(0.8 * len(samples)):int(0.9 * len(samples))]]
             elif self.mode == 'test':
-                # Use 15% for testing
-                samples = [samples[i] for i in indices[int(0.85 * len(samples)):]]
+                # Use 10% for testing (changed from 15%)
+                samples = [samples[i] for i in indices[int(0.9 * len(samples)):]]
         
         print(f"After splitting: {len(samples)} samples in {self.mode} mode")
         return samples
     
-    def _extract_frames(self, video_path, num_frames=8):
-        """Extract frames from video and detect faces"""
+    def _get_cache_path(self, video_path):
+        """Generate a unique cache file path for a video"""
+        video_name = os.path.basename(video_path)
+        cache_filename = f"{os.path.splitext(video_name)[0]}_frames_{self.num_frames}.pkl"
+        return os.path.join(self.cache_dir, cache_filename)
+    
+    def _process_video(self, sample):
+        """Process a single video and save to cache"""
+        video_path = sample['video_path']
+        cache_path = self._get_cache_path(video_path)
+        
+        # Skip if already cached
+        if os.path.exists(cache_path):
+            return f"Skipped (cached): {video_path}"
+            
+        try:
+            frames = self._extract_frames(video_path, self.num_frames)
+            if frames is not None and len(frames) > 0:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(frames, f)
+                return f"Processed: {video_path}"
+            else:
+                return f"Failed (no frames): {video_path}"
+        except Exception as e:
+            return f"Error: {video_path} - {str(e)}"
+    
+    def _preprocess_all_videos(self):
+        """Preprocess all videos in advance and save to cache"""
+        print(f"Preprocessing {len(self.samples)} videos for {self.mode} set...")
+        
+        # Process videos sequentially if there are few samples or in parallel otherwise
+        if len(self.samples) < 10:  # Small dataset - process sequentially
+            results = []
+            for sample in tqdm(self.samples, desc="Preprocessing videos"):
+                results.append(self._process_video(sample))
+        else:
+            # Use a different approach that doesn't require pickling instance methods
+            video_paths = [sample['video_path'] for sample in self.samples]
+            cache_paths = [self._get_cache_path(path) for path in video_paths]
+            
+            # Create work items that don't reference self
+            work_items = []
+            results = []
+            
+            for i, (video_path, cache_path) in enumerate(zip(video_paths, cache_paths)):
+                if os.path.exists(cache_path):
+                    results.append(f"Skipped (cached): {video_path}")
+                else:
+                    # Only process uncached videos
+                    work_items.append((i, video_path, cache_path, self.num_frames))
+            
+            # Process videos in parallel
+            if work_items:
+                num_workers = min(cpu_count(), 8)  # Use up to 8 cores
+                with Pool(num_workers) as pool:
+                    parallel_results = list(tqdm(
+                        pool.imap(process_video_standalone, work_items),
+                        total=len(work_items),
+                        desc="Preprocessing videos"
+                    ))
+                results.extend(parallel_results)
+        
+        # Report results
+        success = sum(1 for r in results if r.startswith("Processed"))
+        skipped = sum(1 for r in results if r.startswith("Skipped"))
+        failed = sum(1 for r in results if r.startswith(("Failed", "Error")))
+        
+        print(f"Preprocessing complete: {success} processed, {skipped} skipped, {failed} failed")
+
+    def _extract_frames(self, video_path, num_frames=6):
+        """Extract frames from video and detect faces with fallback"""
+        # Check cache first
+        cache_path = self._get_cache_path(video_path)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Error loading cache for {video_path}: {e}")
+                # If cache loading fails, continue with normal extraction
+        
         frames = []
         cap = cv2.VideoCapture(video_path)
         
@@ -123,6 +286,10 @@ class DeepfakeDataset(Dataset):
             return None
             
         step = max(1, total_frames // num_frames)
+        
+        # Create detectors locally in this method instead of using instance variables
+        face_detector = MTCNN(keep_all=False, device='cpu')
+        haar_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
         frame_idx = 0
         while len(frames) < num_frames and frame_idx < total_frames:
@@ -135,9 +302,10 @@ class DeepfakeDataset(Dataset):
             # Convert to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Detect face
+            # Detect face with MTCNN
+            face_detected = False
             try:
-                boxes, _ = self.face_detector.detect(frame)
+                boxes, _ = face_detector.detect(frame)  # Use local variable
                 if boxes is not None and len(boxes) > 0:
                     # Get the first face
                     box = boxes[0].astype(int)
@@ -154,9 +322,45 @@ class DeepfakeDataset(Dataset):
                     face = frame[y1:y2, x1:x2]
                     if face.size > 0:
                         frames.append(face)
+                        face_detected = True
             except Exception as e:
-                print(f"Error detecting face: {e}")
+                print(f"MTCNN error: {e}")
+            
+            # Fallback to Haar cascade if MTCNN fails
+            if not face_detected:
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    faces = haar_detector.detectMultiScale(gray, 1.3, 5)  # Use local variable
+                    if len(faces) > 0:
+                        x, y, w, h = faces[0]
+                        
+                        # Add margin
+                        h_img, w_img = frame.shape[:2]
+                        margin = int(min(w_img, h_img) * 0.1)
+                        x1 = max(0, x - margin)
+                        y1 = max(0, y - margin)
+                        x2 = min(w_img, x + w + margin)
+                        y2 = min(h_img, y + h + margin)
+                        
+                        face = frame[y1:y2, x1:x2]
+                        if face.size > 0:
+                            frames.append(face)
+                            face_detected = True
+                except Exception as e:
+                    print(f"Haar cascade error: {e}")
                 
+            # If all detection methods fail, use the whole frame
+            if not face_detected:
+                # Resize to a reasonable size if necessary
+                h, w = frame.shape[:2]
+                if h > 300 and w > 300:
+                    # Center crop
+                    crop_size = min(h, w)
+                    start_h = (h - crop_size) // 2
+                    start_w = (w - crop_size) // 2
+                    frame = frame[start_h:start_h+crop_size, start_w:start_w+crop_size]
+                frames.append(frame)
+            
             frame_idx += step
             
         cap.release()
@@ -165,6 +369,14 @@ class DeepfakeDataset(Dataset):
         if frames and len(frames) < num_frames:
             last_face = frames[-1]
             frames.extend([last_face] * (num_frames - len(frames)))
+        
+        # Save to cache
+        if frames and len(frames) > 0:
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(frames, f)
+            except Exception as e:
+                print(f"Error saving cache for {video_path}: {e}")
             
         return frames
         
@@ -173,14 +385,17 @@ class DeepfakeDataset(Dataset):
             return A.Compose([
                 A.Resize(224, 224),
                 A.HorizontalFlip(p=0.5),
-                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                A.Normalize(),
+                A.RandomRotate90(p=0.3),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+                A.RandomBrightnessContrast(p=0.3),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])
         else:
             return A.Compose([
                 A.Resize(224, 224),
-                A.Normalize(),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])
             
@@ -191,31 +406,44 @@ class DeepfakeDataset(Dataset):
         sample = self.samples[idx]
         
         # Extract frames from video
-        frames = self._extract_frames(sample['video_path'])
+        frames = self._extract_frames(sample['video_path'], self.num_frames)
         
         if frames is None or len(frames) == 0:
             # Fallback: create a blank image
             image = np.zeros((224, 224, 3), dtype=np.uint8)
             transformed = self.transform(image=image)
             image = transformed['image']
+            face_mask = torch.zeros((1, 224, 224), dtype=torch.float32)
             
             return {
                 'image': image,
+                'face_mask': face_mask,
                 'label': torch.tensor(sample['label'], dtype=torch.long),
                 'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
             }
         
+        # Create a face preprocessor locally for this method
+        face_preprocessor = FacePreprocessor()
+        
         # Process each frame
         processed_frames = []
+        face_masks = []
         for frame in frames:
-            transformed = self.transform(image=frame)
-            processed_frames.append(transformed['image'])
+            # Generate face mask for the frame
+            face_mask = face_preprocessor.extract_face_mask(frame)
             
-        # Stack frames
+            # Apply transformations to both image and mask
+            transformed = self.transform(image=frame, mask=face_mask)
+            processed_frames.append(transformed['image'])
+            face_masks.append(torch.tensor(transformed['mask']).unsqueeze(0))
+            
+        # Stack frames and masks
         stacked_frames = torch.stack(processed_frames)
+        stacked_masks = torch.stack(face_masks)
         
         return {
             'image': stacked_frames,
+            'face_mask': stacked_masks,
             'label': torch.tensor(sample['label'], dtype=torch.long),
             'demographics': torch.tensor(sample['demographics'], dtype=torch.long)
         }

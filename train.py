@@ -9,6 +9,9 @@ import logging
 import time
 import platform
 import psutil
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg') 
 
 # Configure logging
 logging.basicConfig(
@@ -82,25 +85,29 @@ def main(args):
     os.makedirs(config['training']['save_dir'], exist_ok=True)
     logger.info(f"Save directory: {config['training']['save_dir']}")
         
-    # Create datasets
-    logger.info("Creating datasets...")
+    # Create datasets with preprocessing
+    logger.info("Creating datasets and preprocessing videos...")
     data_start = time.time()
     
     train_dataset = DeepfakeDataset(
         config['data']['data_path'],
         mode='train',
-        annotations_path=config['data']['annotations_path']
+        annotations_path=config['data']['annotations_path'],
+        preprocess=True,  # Enable preprocessing
+        cache_dir=config['data'].get('cache_dir', None)  # Optional cache directory path
     )
     logger.info(f"Train dataset created with {len(train_dataset)} samples")
     
     val_dataset = DeepfakeDataset(
         config['data']['data_path'],
         mode='val',
-        annotations_path=config['data']['annotations_path']
+        annotations_path=config['data']['annotations_path'],
+        preprocess=True,  # Enable preprocessing
+        cache_dir=config['data'].get('cache_dir', None)  # Optional cache directory path
     )
     logger.info(f"Validation dataset created with {len(val_dataset)} samples")
     
-    logger.info(f"Dataset creation took {time.time() - data_start:.2f} seconds")
+    logger.info(f"Dataset creation and preprocessing took {time.time() - data_start:.2f} seconds")
     
     # Create dataloaders
     logger.info("Creating dataloaders...")
@@ -139,6 +146,16 @@ def main(args):
     # Training loop
     best_val_auc = 0
     logger.info(f"Starting training for {config['training']['num_epochs']} epochs")
+
+
+    epochs = []
+    train_losses = []
+    train_cls_losses = []
+    train_fair_losses = []
+    val_aucs = []
+    val_accuracies = []
+    fairness_gaps = []
+    group_aucs = {}
     
     for epoch in range(config['training']['num_epochs']):
         epoch_start = time.time()
@@ -169,16 +186,96 @@ def main(args):
         logger.info(f"Val AUC: {val_metrics['overall']['auc']:.4f}")
         logger.info(f"Val Accuracy: {val_metrics['overall']['accuracy']:.4f}")
         logger.info(f"Val Fairness Gap: {val_metrics['fairness']['demographic_parity']:.4f}")
+
+        epochs.append(epoch + 1)
+        train_losses.append(train_metrics['total_loss'])
+        train_cls_losses.append(train_metrics['cls_loss'])
+        train_fair_losses.append(train_metrics['fair_loss'])
+        val_aucs.append(val_metrics['overall']['auc'])
+        val_accuracies.append(val_metrics['overall']['accuracy'])
+        fairness_gaps.append(val_metrics['fairness']['demographic_parity'])
+
+        for group, group_metrics in val_metrics.items():
+            if group.startswith('group_'):
+                if group not in group_aucs:
+                    group_aucs[group] = []
+                group_aucs[group].append(group_metrics['auc'])
         
         # Log group metrics
         for group, group_metrics in val_metrics.items():
             if group.startswith('group_'):
                 logger.info(f"Group {group}: AUC={group_metrics['auc']:.4f}, Acc={group_metrics['accuracy']:.4f}")
     
+    # Save final model regardless of performance
+    final_model_name = f"resnet_model_epochs_{config['training']['num_epochs']}.pth"
+    final_model_path = os.path.join(config['training']['save_dir'], final_model_name)
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"Final model saved at {final_model_path}")
+
+    logger.info("Generating training metric plots...")
+    plots_dir = os.path.join(config['training']['save_dir'], 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Plot 1: Training Losses
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, 'b-', label='Total Loss')
+    plt.plot(epochs, train_cls_losses, 'g--', label='Classification Loss')
+    plt.plot(epochs, train_fair_losses, 'r-.', label='Fairness Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Losses')
+    plt.legend()
+    plt.grid(True)
+    loss_plot_path = os.path.join(plots_dir, 'training_losses.png')
+    plt.savefig(loss_plot_path)
+    plt.close()
+    logger.info(f"Saved training losses plot to {loss_plot_path}")
+
+    # Plot 2: Validation Metrics
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, val_aucs, 'b-', label='AUC')
+    plt.plot(epochs, val_accuracies, 'g--', label='Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.title('Validation Metrics')
+    plt.legend()
+    plt.grid(True)
+    val_plot_path = os.path.join(plots_dir, 'validation_metrics.png')
+    plt.savefig(val_plot_path)
+    plt.close()
+    logger.info(f"Saved validation metrics plot to {val_plot_path}")
+    
+    # Plot 3: Fairness Gap
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, fairness_gaps, 'r-')
+    plt.xlabel('Epoch')
+    plt.ylabel('Demographic Parity Gap')
+    plt.title('Fairness Gap (Lower is Better)')
+    plt.grid(True)
+    fairness_plot_path = os.path.join(plots_dir, 'fairness_gap.png')
+    plt.savefig(fairness_plot_path)
+    plt.close()
+    logger.info(f"Saved fairness gap plot to {fairness_plot_path}")
+
+    # Plot 4: Group AUCs
+    plt.figure(figsize=(10, 6))
+    for group, aucs in group_aucs.items():
+        plt.plot(epochs, aucs, label=f'{group}')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC')
+    plt.title('Group-specific AUC')
+    plt.legend()
+    plt.grid(True)
+    group_plot_path = os.path.join(plots_dir, 'group_aucs.png')
+    plt.savefig(group_plot_path)
+    plt.close()
+    logger.info(f"Saved group AUCs plot to {group_plot_path}")
+    
     # Log total training time
     total_time = time.time() - start_time
     logger.info(f"Training completed in {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
     logger.info(f"Best validation AUC: {best_val_auc:.4f}")
+    logger.info(f"Plots saved to {plots_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -1,25 +1,25 @@
 # Model Configuration
 model:
-  backbone: "resnet" # Using ResNet for better CPU performance
+  backbone: "resnet" # Changed from "mobilenet" to "efficientnet"
   num_classes: 2
   pretrained: true
 
 # Training Configuration
 training:
-  batch_size: 2
-  num_epochs: 30
+  batch_size: 8
+  num_epochs: 5
   learning_rate: 0.0001
   weight_decay: 0.00001
   lambda_fair: 1.0
   device: "cpu" # We'll use CPU with OpenMP acceleration
   save_dir: "checkpoints"
   use_openmp: true # Enable OpenMP acceleration
-  num_threads: 8 # Set to number of physical cores on your i7
+  num_threads: 8 
 
 # Data Configuration
 data:
   data_path: "data"
   annotations_path: "data/GBDF_training_labels.xlsx"
-  test_path: "data" # Added for evaluation
+  test_path: "data/test" # Added for evaluation
   image_size: 224
   num_workers: 4
